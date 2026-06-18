@@ -1,0 +1,406 @@
+{==============================================================
+  ROBÔ FOREX - EXAUSTÃO DE TENDÊNCIA POR VOLATILIDADE E VOLUME
+  v1.0 — Adaptado da versão WIN v3.1
+
+  Instrumento  : Pares Forex (EURUSD, GBPUSD, USDJPY, etc.)
+  Time Frame   : M5 ou M15 (M1 tem spread muito impactante)
+  Plataforma   : Profit Pro (Nelogica)
+  Linguagem    : NTSL - Nelogica Trading System Language
+
+  ── Diferenças em relação à versão WIN ───────────────────────
+
+  [1] VOLUME — mudança mais crítica
+      No WIN, FinancialVolume reflete capital real movimentado.
+      No Forex de varejo NÃO existe volume financeiro real —
+      corretoras reportam apenas "tick volume" (número de
+      variações de preço por candle). A função Volume() é
+      usada como proxy: candles com muitos ticks indicam maior
+      atividade, mas NÃO confirmam presença institucional com
+      a mesma confiabilidade. Use o filtro com FatorVolume mais
+      conservador (1.8–2.0) para compensar o ruído extra.
+
+  [2] HORÁRIO — sessões substituem pregão
+      Forex opera 24h de segunda a sexta. Não existe "pregão"
+      fixo. O robô deve operar apenas durante sessões de alta
+      liquidez. Padrão configurado: sobreposição Londres/NY
+      (13:00–17:00 UTC). ATENÇÃO: ajuste os horários conforme
+      o fuso do servidor da sua corretora (geralmente UTC ou
+      UTC+2 em plataformas MT/Profit internacionais).
+
+      Sessões de referência (UTC):
+        Sidney  : 22:00–07:00
+        Tóquio  : 00:00–09:00
+        Londres : 08:00–17:00  ← maior volume
+        Nova York: 13:00–22:00
+        Overlap Londres+NY: 13:00–17:00 ← melhor para day trade
+
+  [3] META E PERDA DIÁRIA — unidade muda de pontos para pips
+      No WIN, stop/alvo são inteiros (120 pontos).
+      No Forex, os preços são decimais. O ATR retorna o valor
+      em unidades de preço do par (ex: 0.00120 para EURUSD =
+      12 pips). MetaPipsDia e MaxPerdaDiariaPips seguem a
+      mesma lógica mas em unidades de preço do par operado:
+        EURUSD/GBPUSD : 1 pip = 0.0001  (MetaPips ~0.0150)
+        USDJPY        : 1 pip = 0.01    (MetaPips ~1.50)
+      Ajuste os defaults conforme o par que irá operar.
+
+  [4] ZERAGEM — opcional no Forex
+      No WIN a zeragem é obrigatória (não pode carregar posição
+      overnight no mini índice). No Forex é uma OPÇÃO.
+      Se FecharNoDia = true, ClosePosition é chamado em
+      HoraZerar. Se false, a posição pode ser mantida overnight
+      (swap/rolagem será cobrado pela corretora).
+
+  ── Parâmetros que NÃO mudam ─────────────────────────────────
+  Bollinger, ADX, RSI, EMA, ATR (multiplicadores), cool-down
+  e limite de trades diários funcionam identicamente.
+  O ATR já normaliza stop/alvo à volatilidade do par.
+==============================================================}
+
+
+// ============================================================
+// SEÇÃO 1: PARÂMETROS DE ENTRADA
+// ============================================================
+input
+  { --- Controle de Horário (ajuste para o fuso do servidor) ---
+    Padrão: overlap Londres + Nova York em UTC.
+    Se sua corretora usa UTC+2 (comum em brokers europeus),
+    adicione 2h: HoraInicio=1500, HoraFim=1900, HoraZerar=1930 }
+  HoraInicio    : integer := 1300;  { Início da janela (13h00 UTC = overlap L+NY)  }
+  HoraFim       : integer := 1700;  { Fim de novas entradas (17h00 UTC)            }
+  HoraZerar     : integer := 1730;  { Encerramento forçado (se FecharNoDia = true) }
+
+  { --- Opção de Zeragem Diária ---
+    true  → fecha posição aberta em HoraZerar (day trade puro)
+    false → posição pode ser mantida overnight (swing trade)    }
+  FecharNoDia   : boolean := true;
+
+  { --- Bandas de Bollinger ---
+    Mesmos defaults do WIN. Período 20 é universal.
+    Em M15 considere testar PeriodoBanda = 14 ou 15. }
+  PeriodoBanda  : integer := 20;
+  DesvioBanda   : float   := 2.5;
+
+  { --- Filtro de Volume (TICK VOLUME no Forex) ---
+    FatorVolume elevado para compensar ruído do tick volume.
+    Recomendado: 1.8–2.2 para pares principais (EURUSD, GBPUSD)
+                 2.0–2.5 para pares cruzados (EURJPY, GBPJPY) }
+  PeriodoVolume : integer := 20;
+  FatorVolume   : float   := 2.0;   { Mais conservador que WIN (era 1.5) }
+
+  { --- ADX: Regime de Mercado ---
+    Forex tende a ter tendências mais longas que índices futuros.
+    LimiteADX pode ser ligeiramente mais baixo (20–25) para ser
+    mais seletivo, ou manter 28 como no WIN. }
+  PeriodoADX    : integer := 14;
+  LimiteADX     : float   := 25.0;  { Mais restritivo que WIN (era 28) }
+
+  { --- RSI: Exaustão Direcional ---
+    Mesmos defaults. Em M15 os extremos são mais confiáveis. }
+  PeriodoRSI     : integer := 14;
+  LimiteRSIBaixo : float   := 35.0;
+  LimiteRSIAlto  : float   := 65.0;
+
+  { --- Largura de Banda em % ---
+    Forex tem volatilidade diferente do WIN. Ajuste conforme o par:
+      EURUSD M5:  LarguraMin 0.05, LarguraMax 0.50
+      GBPUSD M5:  LarguraMin 0.06, LarguraMax 0.65
+      USDJPY M5:  LarguraMin 0.04, LarguraMax 0.45
+    Valores padrão: conservadores para pares principais. }
+  LarguraMinPct : float := 0.05;   { Diferente do WIN (era 0.4) }
+  LarguraMaxPct : float := 0.60;   { Diferente do WIN (era 3.5) }
+
+  { --- EMA de Tendência Intraday ---
+    50 períodos em M5  ≈ tendência das últimas 4h
+    50 períodos em M15 ≈ tendência das últimas 12h
+    Ajuste para o timeframe utilizado. }
+  PeriodoEMA    : integer := 50;
+
+  { --- ATR para Gestão Dinâmica de Risco ---
+    Funciona identicamente ao WIN.
+    ATR retorna em unidades de preço do par:
+      EURUSD M5 ATR típico: 0.00060–0.00120 (6–12 pips)
+    Stop = ATR × 1.5 | Alvo = ATR × 2.5 → R:R ≈ 1.67 }
+  PeriodoATR        : integer := 14;
+  MultiplicadorStop : float   := 1.5;
+  MultiplicadorAlvo : float   := 2.5;
+
+  { --- Controles de Disciplina ---
+    Mesmos do WIN. }
+  MaxTradesDia  : integer := 3;
+  BaresEspera   : integer := 3;
+
+  { --- Meta e Perda Diária em Unidades de Preço do Par ---
+    IMPORTANTE: a unidade é o preço nativo do par (não pips inteiros).
+    Exemplos de configuração:
+      EURUSD: 150 pips = 0.0150 | 100 pips = 0.0100
+      GBPUSD: 150 pips = 0.0150 | 100 pips = 0.0100
+      USDJPY: 150 pips = 1.50   | 100 pips = 1.00
+    Ajuste obrigatório conforme o par operado. }
+  MetaPipsDia      : float := 0.0150;  { Meta diária (padrão: 150 pips EURUSD) }
+  MaxPerdaDiariaPips : float := 0.0100; { Stop diário (padrão: 100 pips EURUSD) }
+end;
+
+
+// ============================================================
+// SEÇÃO 2: DECLARAÇÃO DE VARIÁVEIS LOCAIS
+// ============================================================
+var
+  { Bollinger }
+  MediaMovel  : float;
+  DesvioP     : float;
+  BandaSup    : float;
+  BandaInf    : float;
+  LarguraPct  : float;
+
+  { Volume — TICK VOLUME no Forex (não financeiro) }
+  VolAtual    : float;
+  MediaVol    : float;
+
+  { Indicadores }
+  ValorADX    : float;
+  ValorRSI    : float;
+  ValorRSIAnt : float;
+  ValorEMA    : float;
+  ValorATR    : float;
+
+  { Controle de Sessão }
+  DataAnterior   : integer;
+  ContadorTrades : integer;
+  CoolDown       : integer;
+  PosicaoAnt     : boolean;
+
+  { Controle de P&L Diário (em unidades de preço do par) }
+  LucroDiario       : float;
+  ResultadoTrade    : float;
+  PrecoEntradaSalvo : float;
+  DirecaoLong       : boolean;
+
+  { Ordens }
+  PrecoAlvo    : float;
+  PrecoStop    : float;
+
+  { Critérios Atômicos }
+  Crit_RejeicaoLong  : boolean;
+  Crit_RejeicaoShort : boolean;
+  Crit_Volume        : boolean;
+  Crit_ADX           : boolean;
+  Crit_RSILong       : boolean;
+  Crit_RSIShort      : boolean;
+  Crit_LarguraBanda  : boolean;
+  Crit_EMALong       : boolean;
+  Crit_EMAShort      : boolean;
+  Crit_MomLong       : boolean;
+  Crit_MomShort      : boolean;
+  Crit_Disciplina    : boolean;
+
+  { Sinais Compostos }
+  SinalLong    : boolean;
+  SinalShort   : boolean;
+
+  { Horário }
+  JanelaAberta : boolean;
+  DeveZerar    : boolean;
+
+
+begin
+
+  // ============================================================
+  // SEÇÃO 3: CÁLCULO DOS INDICADORES
+  // ============================================================
+
+  MediaMovel := Average(Close, PeriodoBanda);
+  DesvioP    := StdDev(Close, PeriodoBanda);
+  BandaSup   := MediaMovel + (DesvioP * DesvioBanda);
+  BandaInf   := MediaMovel - (DesvioP * DesvioBanda);
+  LarguraPct := ((BandaSup - BandaInf) / MediaMovel) * 100;
+
+  { FOREX: Volume() = tick volume (variações de preço por candle)
+    NÃO é volume financeiro real. Usado como proxy de atividade.
+    No WIN era: FinancialVolume. Aqui é obrigatoriamente: Volume }
+  VolAtual := Volume;
+  MediaVol := Average(Volume, PeriodoVolume);
+
+  ValorADX := ADX(PeriodoADX);
+  ValorRSI := RSI(Close, PeriodoRSI);
+  ValorEMA := ExpAverage(Close, PeriodoEMA);
+  ValorATR := ATR(PeriodoATR);
+
+
+  // ============================================================
+  // SEÇÃO 4: CONTROLE DE HORÁRIO (SESSÕES FOREX)
+  // ============================================================
+
+  { ATENÇÃO: Time retorna o horário no fuso do servidor da corretora.
+    Confirme o fuso antes de configurar HoraInicio e HoraFim.
+    Brokers brasileiros (Profit): geralmente BRT (UTC-3)
+    Brokers internacionais (MT4/5 integrados): geralmente UTC+2 }
+  JanelaAberta := (Time >= HoraInicio) and (Time < HoraFim);
+
+  { Zeragem só é avaliada se FecharNoDia = true }
+  DeveZerar := FecharNoDia and (Time >= HoraZerar);
+
+
+  // ============================================================
+  // SEÇÃO 5: RESET DIÁRIO
+  // ============================================================
+
+  if Date <> DataAnterior then
+  begin
+    ContadorTrades := 0;
+    LucroDiario    := 0;
+    DataAnterior   := Date;
+  end;
+
+
+  // ============================================================
+  // SEÇÃO 6: RASTREAMENTO DE P&L E COOL-DOWN
+  // ============================================================
+
+  if PosicaoAnt and (not HasPosition) then
+  begin
+    { Detecta qual nível foi atingido no bar de encerramento }
+    if DirecaoLong then
+    begin
+      if Low <= PrecoStop then
+        ResultadoTrade := PrecoStop - PrecoEntradaSalvo
+      else if High >= PrecoAlvo then
+        ResultadoTrade := PrecoAlvo - PrecoEntradaSalvo
+      else
+        ResultadoTrade := Close - PrecoEntradaSalvo;
+    end
+    else
+    begin
+      if High >= PrecoStop then
+        ResultadoTrade := PrecoEntradaSalvo - PrecoStop
+      else if Low <= PrecoAlvo then
+        ResultadoTrade := PrecoEntradaSalvo - PrecoAlvo
+      else
+        ResultadoTrade := PrecoEntradaSalvo - Close;
+    end;
+
+    LucroDiario := LucroDiario + ResultadoTrade;
+    CoolDown    := BaresEspera;
+  end;
+
+  if CoolDown > 0 then
+    CoolDown := CoolDown - 1;
+
+  PosicaoAnt := HasPosition;
+
+
+  // ============================================================
+  // SEÇÃO 7: ZERAGEM (OPCIONAL — somente se FecharNoDia = true)
+  // ============================================================
+
+  if DeveZerar and HasPosition then
+  begin
+    ClosePosition;
+  end
+
+
+  // ============================================================
+  // SEÇÃO 8: AVALIAÇÃO DE CRITÉRIOS E EXECUÇÃO
+  // ============================================================
+
+  else if JanelaAberta and (not HasPosition) and (CoolDown = 0) then
+  begin
+
+    { === CRITÉRIOS BASE === }
+
+    { Rejeição de sombra: sinal mais confiável em Forex também.
+      Spreads no Forex fazem o preço "furar" bandas com mais
+      frequência, tornando a rejeição ainda mais importante
+      que o simples fechamento fora da banda. }
+    Crit_RejeicaoLong  := (Low < BandaInf)  and (Close >= BandaInf);
+    Crit_RejeicaoShort := (High > BandaSup) and (Close <= BandaSup);
+
+    { Tick volume acima do limiar × fator (2.0 no Forex vs 1.5 no WIN) }
+    Crit_Volume := (VolAtual > (MediaVol * FatorVolume));
+
+    { ADX mais restritivo (25) pois Forex tende a trends mais longos }
+    Crit_ADX := (ValorADX < LimiteADX);
+
+    Crit_RSILong  := (ValorRSI < LimiteRSIBaixo);
+    Crit_RSIShort := (ValorRSI > LimiteRSIAlto);
+
+    { Largura em % recalibrada para volatilidade de pares Forex }
+    Crit_LarguraBanda := (LarguraPct >= LarguraMinPct) and (LarguraPct <= LarguraMaxPct);
+
+    { EMA de tendência — idêntico ao WIN }
+    Crit_EMALong  := (Close > ValorEMA);
+    Crit_EMAShort := (Close < ValorEMA);
+
+    { RSI virando — idêntico ao WIN }
+    Crit_MomLong  := (ValorRSI > ValorRSIAnt);
+    Crit_MomShort := (ValorRSI < ValorRSIAnt);
+
+    { Meta e perda em unidades de preço do par (floats, não inteiros) }
+    Crit_Disciplina := (ContadorTrades < MaxTradesDia)
+                   and (LucroDiario < MetaPipsDia)
+                   and (LucroDiario > -MaxPerdaDiariaPips);
+
+    { === COMPOSIÇÃO === }
+
+    SinalLong := Crit_RejeicaoLong
+             and Crit_Volume
+             and Crit_ADX
+             and Crit_RSILong
+             and Crit_LarguraBanda
+             and Crit_EMALong
+             and Crit_MomLong
+             and Crit_Disciplina;
+
+    SinalShort := Crit_RejeicaoShort
+              and Crit_Volume
+              and Crit_ADX
+              and Crit_RSIShort
+              and Crit_LarguraBanda
+              and Crit_EMAShort
+              and Crit_MomShort
+              and Crit_Disciplina;
+
+    { === EXECUÇÃO — COMPRA === }
+
+    if SinalLong then
+    begin
+      { ATR em Forex retorna em unidades de preço do par:
+        EURUSD ATR=0.00080 → Stop=0.00120, Alvo=0.00200 (12/20 pips) }
+      PrecoAlvo := Close + (ValorATR * MultiplicadorAlvo);
+      PrecoStop := Close - (ValorATR * MultiplicadorStop);
+
+      BuyAtMarket;
+      SellToLimit(PrecoAlvo);
+      SellToStop(PrecoStop);
+
+      PrecoEntradaSalvo := Close;
+      DirecaoLong       := true;
+      ContadorTrades    := ContadorTrades + 1;
+    end
+
+    { === EXECUÇÃO — VENDA === }
+
+    else if SinalShort then
+    begin
+      PrecoAlvo := Close - (ValorATR * MultiplicadorAlvo);
+      PrecoStop := Close + (ValorATR * MultiplicadorStop);
+
+      SellShortAtMarket;
+      BuyToLimit(PrecoAlvo);
+      BuyToStop(PrecoStop);
+
+      PrecoEntradaSalvo := Close;
+      DirecaoLong       := false;
+      ContadorTrades    := ContadorTrades + 1;
+    end;
+
+  end;
+
+
+  // ============================================================
+  // SEÇÃO 9: ATUALIZAÇÃO DE ESTADO
+  // ============================================================
+
+  ValorRSIAnt := ValorRSI;
+
+end;
