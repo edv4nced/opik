@@ -1,0 +1,215 @@
+{==============================================================
+  ROBÔ WIN - EXAUSTÃO DE TENDÊNCIA POR VOLATILIDADE E VOLUME
+
+  Instrumento  : Mini Índice Futuro (WIN)
+  Time Frame   : M1 ou M5
+  Plataforma   : Profit Pro (Nelogica)
+  Linguagem    : NTSL - Nelogica Trading System Language
+
+  Estratégia   : Reversão à Média por Exaustão Institucional
+
+  Premissa Operacional:
+    Quando o preço rompe as Bandas de Bollinger acompanhado de
+    volume financeiro acima da média (atividade institucional),
+    interpreta-se como exaustão do movimento vigente. O robô
+    posiciona contra esse excesso esperando a reversão à média.
+
+  Lógica de Entrada:
+    LONG  → fechamento ABAIXO da Banda Inferior + volume elevado
+            (vendedores exaustos; possível reversão de alta)
+    SHORT → fechamento ACIMA da Banda Superior + volume elevado
+            (compradores exaustos; possível reversão de baixa)
+
+  Gestão de Risco:
+    Alvo e Stop fixos em pontos do WIN com ordens OCO.
+    Zeragem compulsória ao atingir o horário configurado.
+
+  Versão       : 1.0
+  Data         : 2026-06-18
+==============================================================}
+
+
+// ============================================================
+// SEÇÃO 1: PARÂMETROS DE ENTRADA
+// ============================================================
+input
+  { --- Controle de Horário --- }
+  HoraInicio    : integer := 910;   { Início da janela de entradas  (09h10m) }
+  HoraFim       : integer := 1645;  { Fim da janela de novas entradas (16h45m) }
+  HoraZerar     : integer := 1720;  { Zeragem compulsória de posições (17h20m) }
+
+  { --- Gestão de Risco Fixo --- }
+  AlvoPontos    : integer := 150;   { Objetivo de ganho em pontos do WIN }
+  StopPontos    : integer := 120;   { Limite de perda em pontos do WIN   }
+
+  { --- Bandas de Bollinger --- }
+  PeriodoBanda  : integer := 20;    { Períodos para a média e desvio da banda }
+  DesvioBanda   : float   := 2.5;   { Número de desvios padrão (largura)      }
+
+  { --- Filtro de Volume Institucional --- }
+  PeriodoVolume : integer := 20;    { Períodos para a média de volume financeiro }
+  FatorVolume   : float   := 1.5;   { Volume mínimo = média × fator (1.5x)      }
+end;
+
+
+// ============================================================
+// SEÇÃO 2: DECLARAÇÃO DE VARIÁVEIS LOCAIS
+// ============================================================
+var
+  { Componentes das Bandas de Bollinger }
+  MediaMovel  : float;   { Média Móvel Simples — linha central da banda }
+  DesvioP     : float;   { Desvio padrão dos fechamentos no período     }
+  BandaSup    : float;   { Banda Superior = Média + (Desvio × DesvioBanda) }
+  BandaInf    : float;   { Banda Inferior = Média - (Desvio × DesvioBanda) }
+
+  { Filtro de Volume }
+  VolAtual    : float;   { Volume financeiro do candle corrente         }
+  MediaVol    : float;   { Média do volume financeiro dos últimos N períodos }
+
+  { Controle de Tempo }
+  HoraAtual   : integer; { Horário do candle atual no formato inteiro HHMM }
+
+  { Níveis de Saída das Ordens }
+  PrecoAlvo   : float;   { Preço-alvo de take profit (saída no lucro)   }
+  PrecoStop   : float;   { Preço de stop loss        (saída no prejuízo) }
+
+  { Sinais de Mercado }
+  SinalLong   : boolean; { TRUE → condição de compra confirmada          }
+  SinalShort  : boolean; { TRUE → condição de venda a descoberto confirmada }
+
+  { Flags de Controle Operacional }
+  JanelaAberta : boolean; { TRUE → dentro da janela de negociação         }
+  DeveZerar    : boolean; { TRUE → horário de zeragem compulsória atingido }
+
+
+begin
+
+  // ============================================================
+  // SEÇÃO 3: CÁLCULO DOS INDICADORES TÉCNICOS
+  // ============================================================
+
+  { Média Móvel Simples do fechamento: linha central de Bollinger }
+  MediaMovel := Average(Close, PeriodoBanda);
+
+  { Desvio padrão dos fechamentos: determina a largura da banda }
+  DesvioP := StdDev(Close, PeriodoBanda);
+
+  { Banda Superior: sobrecompra quando o preço fecha acima }
+  BandaSup := MediaMovel + (DesvioP * DesvioBanda);
+
+  { Banda Inferior: sobrevenda quando o preço fecha abaixo }
+  BandaInf := MediaMovel - (DesvioP * DesvioBanda);
+
+  { Volume financeiro do candle atual (capital movimentado = volume × preço)
+    Reflete a presença institucional com maior precisão que o volume simples.
+    Caso a função FinancialVolume não esteja disponível na versão do Profit,
+    substitua por: VolAtual := Volume; }
+  VolAtual := FinancialVolume;
+
+  { Média do volume financeiro dos últimos N períodos (linha de base) }
+  MediaVol := Average(FinancialVolume, PeriodoVolume);
+
+
+  // ============================================================
+  // SEÇÃO 4: AVALIAÇÃO DO HORÁRIO OPERACIONAL
+  // ============================================================
+
+  { Horário do candle atual em formato HHMM (ex: 09h15m = 915) }
+  HoraAtual := Time;
+
+  { Janela de entradas: apenas entre HoraInicio e HoraFim }
+  JanelaAberta := (HoraAtual >= HoraInicio) and (HoraAtual < HoraFim);
+
+  { Zeragem: ativada a partir de HoraZerar, independente de sinal }
+  DeveZerar := (HoraAtual >= HoraZerar);
+
+
+  // ============================================================
+  // SEÇÃO 5: ZERAGEM COMPULSÓRIA — MÁXIMA PRIORIDADE
+  //
+  // Avaliada ANTES de qualquer sinal para garantir que nenhuma
+  // posição sobreviva ao horário configurado. ClosePosition envia
+  // ordem a mercado e cancela todas as ordens pendentes (OCO).
+  // ============================================================
+  if DeveZerar and HasPosition then
+  begin
+    ClosePosition;
+  end
+
+  // ============================================================
+  // SEÇÃO 6: LÓGICA DE SINAIS E EXECUÇÃO DE ORDENS
+  //
+  // Pré-condições obrigatórias para qualquer nova entrada:
+  //   1. JanelaAberta = TRUE  → dentro do horário operacional
+  //   2. HasPosition  = FALSE → sem posição aberta no momento
+  //      (evita preço médio e reentradas no mesmo movimento)
+  // ============================================================
+  else if JanelaAberta and (not HasPosition) then
+  begin
+
+    // ----------------------------------------------------------
+    // DEFINIÇÃO DOS SINAIS DE MERCADO
+    //
+    // Exaustão por Volatilidade + Confirmação de Volume:
+    //
+    //   SINAL LONG  → preço perfura a banda inferior com volume
+    //                 acima de (MediaVol × FatorVolume).
+    //                 Leitura: vendedores capitulando + presença
+    //                 institucional = reversão de alta provável.
+    //
+    //   SINAL SHORT → preço perfura a banda superior com volume
+    //                 acima de (MediaVol × FatorVolume).
+    //                 Leitura: compradores esgotados + presença
+    //                 institucional = reversão de baixa provável.
+    // ----------------------------------------------------------
+
+    { Sinal de Compra: fechamento abaixo da Banda Inferior com volume elevado }
+    SinalLong := (Close < BandaInf) and (VolAtual > (MediaVol * FatorVolume));
+
+    { Sinal de Venda: fechamento acima da Banda Superior com volume elevado }
+    SinalShort := (Close > BandaSup) and (VolAtual > (MediaVol * FatorVolume));
+
+
+    // ----------------------------------------------------------
+    // EXECUÇÃO DA COMPRA (LONG)
+    // ----------------------------------------------------------
+    if SinalLong then
+    begin
+      { Calcula os níveis de saída a partir do fechamento do candle de sinal }
+      PrecoAlvo := Close + AlvoPontos;  { Take profit acima da entrada }
+      PrecoStop := Close - StopPontos;  { Stop loss abaixo da entrada  }
+
+      { Envia ordem de compra a mercado }
+      BuyAtMarket;
+
+      { Par OCO de saída para posição comprada:
+          SellToLimit → venda limitada no alvo   (take profit)
+          SellToStop  → venda com stop no gatilho (stop loss)
+        A execução de uma cancela automaticamente a outra. }
+      SellToLimit(PrecoAlvo);
+      SellToStop(PrecoStop);
+    end
+
+    // ----------------------------------------------------------
+    // EXECUÇÃO DA VENDA A DESCOBERTO (SHORT)
+    // ----------------------------------------------------------
+    else if SinalShort then
+    begin
+      { Calcula os níveis de saída a partir do fechamento do candle de sinal }
+      PrecoAlvo := Close - AlvoPontos;  { Take profit abaixo da entrada }
+      PrecoStop := Close + StopPontos;  { Stop loss acima da entrada    }
+
+      { Envia ordem de venda a descoberto a mercado }
+      SellShortAtMarket;
+
+      { Par OCO de saída para posição vendida:
+          BuyToLimit → compra limitada no alvo    (take profit)
+          BuyToStop  → compra com stop no gatilho (stop loss)
+        A execução de uma cancela automaticamente a outra. }
+      BuyToLimit(PrecoAlvo);
+      BuyToStop(PrecoStop);
+    end;
+
+  end; { fim do bloco JanelaAberta }
+
+end;
