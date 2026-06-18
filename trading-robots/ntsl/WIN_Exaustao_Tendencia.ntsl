@@ -1,5 +1,6 @@
 {==============================================================
   ROBÔ WIN - EXAUSTÃO DE TENDÊNCIA POR VOLATILIDADE E VOLUME
+  v2.0 — Filtros de Alta Acurácia
 
   Instrumento  : Mini Índice Futuro (WIN)
   Time Frame   : M1 ou M5
@@ -14,17 +15,37 @@
     interpreta-se como exaustão do movimento vigente. O robô
     posiciona contra esse excesso esperando a reversão à média.
 
-  Lógica de Entrada:
-    LONG  → fechamento ABAIXO da Banda Inferior + volume elevado
-            (vendedores exaustos; possível reversão de alta)
-    SHORT → fechamento ACIMA da Banda Superior + volume elevado
-            (compradores exaustos; possível reversão de baixa)
+  Melhorias v2.0 (aumento de taxa de acerto):
+    [FILTRO 1 — ADX]
+      Só opera quando ADX < LimiteADX. Mercados com ADX alto
+      estão em tendência forte; Bollinger reverte menos e o
+      preço continua contra a posição. Este é o filtro de
+      maior impacto individual para estratégias de reversão.
+
+    [FILTRO 2 — RSI]
+      Exige RSI < LimiteRSIBaixo para Long e RSI > LimiteRSIAlto
+      para Short. Dupla confirmação de exaustão: a velocidade
+      do movimento (RSI) reforça a sobrevenda/sobrecompra já
+      indicada pela banda de Bollinger.
+
+    [FILTRO 3 — REJEIÇÃO DE SOMBRA]
+      Em vez de entrar quando o fechamento está fora da banda,
+      aguarda o padrão mais forte: Low < BandaInf mas Close
+      voltou acima da banda (Long), ou High > BandaSup mas
+      Close voltou abaixo (Short). Significa que o mercado
+      tentou romper, encontrou reação institucional e reverteu
+      no mesmo candle — sinal de exaustão mais confiável.
+
+    [AJUSTE DE HORÁRIO]
+      HoraInicio avançado de 09h10 para 09h25 para evitar
+      os primeiros 15 minutos de pregão, onde o desequilíbrio
+      de ordens da abertura gera spikes não operáveis.
 
   Gestão de Risco:
     Alvo e Stop fixos em pontos do WIN com ordens OCO.
     Zeragem compulsória ao atingir o horário configurado.
 
-  Versão       : 1.0
+  Versão       : 2.0
   Data         : 2026-06-18
 ==============================================================}
 
@@ -34,8 +55,8 @@
 // ============================================================
 input
   { --- Controle de Horário --- }
-  HoraInicio    : integer := 910;   { Início da janela de entradas  (09h10m) }
-  HoraFim       : integer := 1645;  { Fim da janela de novas entradas (16h45m) }
+  HoraInicio    : integer := 925;   { Início após estabilização da abertura (09h25m) }
+  HoraFim       : integer := 1630;  { Fim das entradas — evita ruído do encerramento }
   HoraZerar     : integer := 1720;  { Zeragem compulsória de posições (17h20m) }
 
   { --- Gestão de Risco Fixo --- }
@@ -44,11 +65,30 @@ input
 
   { --- Bandas de Bollinger --- }
   PeriodoBanda  : integer := 20;    { Períodos para a média e desvio da banda }
-  DesvioBanda   : float   := 2.5;   { Número de desvios padrão (largura)      }
+  DesvioBanda   : float   := 2.5;   { Número de desvios padrão (largura da banda) }
 
   { --- Filtro de Volume Institucional --- }
   PeriodoVolume : integer := 20;    { Períodos para a média de volume financeiro }
-  FatorVolume   : float   := 1.5;   { Volume mínimo = média × fator (1.5x)      }
+  FatorVolume   : float   := 1.5;   { Volume mínimo = média × fator (ex: 1.5x) }
+
+  { --- FILTRO 1: ADX — Regime de Mercado --- }
+  { Impede entradas em mercados com tendência forte, onde reversão à média falha.
+    Abaixo do limite = mercado lateral = terreno fértil para estratégia Bollinger. }
+  PeriodoADX    : integer := 14;    { Período padrão do ADX (14 períodos) }
+  LimiteADX     : float   := 28.0;  { ADX acima deste valor = tendência → NÃO opera }
+
+  { --- FILTRO 2: RSI — Confirmação de Exaustão Direcional --- }
+  { Garante que a velocidade do movimento confirme a exaustão indicada pela banda.
+    Evita entradas quando o preço está na banda mas RSI ainda está neutro. }
+  PeriodoRSI      : integer := 14;  { Período padrão do RSI (14 períodos) }
+  LimiteRSIBaixo  : float   := 35.0; { RSI abaixo = sobrevenda confirmada (Long) }
+  LimiteRSIAlto   : float   := 65.0; { RSI acima = sobrecompra confirmada (Short) }
+
+  { --- Filtro de Largura de Banda --- }
+  { Banda estreita demais = sem volatilidade, operação não viável.
+    Banda larga demais = tendência forte disfarçada, reversão arriscada. }
+  LarguraMinPct : float := 0.4;     { Largura mínima da banda em % do preço médio }
+  LarguraMaxPct : float := 3.5;     { Largura máxima da banda em % do preço médio }
 end;
 
 
@@ -57,28 +97,45 @@ end;
 // ============================================================
 var
   { Componentes das Bandas de Bollinger }
-  MediaMovel  : float;   { Média Móvel Simples — linha central da banda }
-  DesvioP     : float;   { Desvio padrão dos fechamentos no período     }
-  BandaSup    : float;   { Banda Superior = Média + (Desvio × DesvioBanda) }
-  BandaInf    : float;   { Banda Inferior = Média - (Desvio × DesvioBanda) }
+  MediaMovel   : float;  { Média Móvel Simples — linha central da banda }
+  DesvioP      : float;  { Desvio padrão dos fechamentos no período }
+  BandaSup     : float;  { Banda Superior = Média + (Desvio × DesvioBanda) }
+  BandaInf     : float;  { Banda Inferior = Média - (Desvio × DesvioBanda) }
+  LarguraPct   : float;  { Largura percentual da banda em relação ao preço médio }
 
   { Filtro de Volume }
-  VolAtual    : float;   { Volume financeiro do candle corrente         }
-  MediaVol    : float;   { Média do volume financeiro dos últimos N períodos }
+  VolAtual     : float;  { Volume financeiro do candle corrente }
+  MediaVol     : float;  { Média do volume financeiro dos últimos N períodos }
+
+  { Filtros de Confirmação v2.0 }
+  ValorADX     : float;  { Valor atual do ADX — mede força da tendência }
+  ValorRSI     : float;  { Valor atual do RSI — mede velocidade e exaustão }
 
   { Controle de Tempo }
-  HoraAtual   : integer; { Horário do candle atual no formato inteiro HHMM }
+  HoraAtual    : integer; { Horário do candle atual no formato inteiro HHMM }
 
   { Níveis de Saída das Ordens }
-  PrecoAlvo   : float;   { Preço-alvo de take profit (saída no lucro)   }
-  PrecoStop   : float;   { Preço de stop loss        (saída no prejuízo) }
+  PrecoAlvo    : float;  { Preço-alvo de take profit (saída no lucro) }
+  PrecoStop    : float;  { Preço de stop loss        (saída no prejuízo) }
 
-  { Sinais de Mercado }
-  SinalLong   : boolean; { TRUE → condição de compra confirmada          }
-  SinalShort  : boolean; { TRUE → condição de venda a descoberto confirmada }
+  { --- Sinais Atômicos (um por critério) --- }
+  { Separados para facilitar debug no log do Profit Pro }
+  Crit_BandaLong    : boolean; { [v1] Preço fechou abaixo da banda inferior }
+  Crit_BandaShort   : boolean; { [v1] Preço fechou acima da banda superior }
+  Crit_Volume       : boolean; { [v1] Volume acima do limiar configurado }
+  Crit_ADX          : boolean; { [v2] ADX abaixo do limite (mercado lateral) }
+  Crit_RSILong      : boolean; { [v2] RSI em zona de sobrevenda }
+  Crit_RSIShort     : boolean; { [v2] RSI em zona de sobrecompra }
+  Crit_RejeicaoLong : boolean; { [v2] Sombra inferior furou banda mas fechou acima }
+  Crit_RejeicaoShort: boolean; { [v2] Sombra superior furou banda mas fechou abaixo }
+  Crit_LarguraBanda : boolean; { [v2] Largura da banda dentro dos limites operacionais }
+
+  { Sinais Compostos Finais }
+  SinalLong    : boolean; { TRUE → todos os critérios de compra confirmados }
+  SinalShort   : boolean; { TRUE → todos os critérios de venda confirmados }
 
   { Flags de Controle Operacional }
-  JanelaAberta : boolean; { TRUE → dentro da janela de negociação         }
+  JanelaAberta : boolean; { TRUE → dentro da janela de negociação }
   DeveZerar    : boolean; { TRUE → horário de zeragem compulsória atingido }
 
 
@@ -88,10 +145,10 @@ begin
   // SEÇÃO 3: CÁLCULO DOS INDICADORES TÉCNICOS
   // ============================================================
 
-  { Média Móvel Simples do fechamento: linha central de Bollinger }
+  { Média Móvel Simples do fechamento — linha central de Bollinger }
   MediaMovel := Average(Close, PeriodoBanda);
 
-  { Desvio padrão dos fechamentos: determina a largura da banda }
+  { Desvio padrão dos fechamentos — determina a largura da banda }
   DesvioP := StdDev(Close, PeriodoBanda);
 
   { Banda Superior: sobrecompra quando o preço fecha acima }
@@ -100,36 +157,48 @@ begin
   { Banda Inferior: sobrevenda quando o preço fecha abaixo }
   BandaInf := MediaMovel - (DesvioP * DesvioBanda);
 
-  { Volume financeiro do candle atual (capital movimentado = volume × preço)
-    Reflete a presença institucional com maior precisão que o volume simples.
-    Caso a função FinancialVolume não esteja disponível na versão do Profit,
-    substitua por: VolAtual := Volume; }
+  { Largura da banda em relação ao preço médio (em %)
+    Quanto maior a %, mais volátil está o mercado }
+  LarguraPct := ((BandaSup - BandaInf) / MediaMovel) * 100;
+
+  { Volume financeiro do candle atual (capital movimentado = contratos × preço)
+    Caso FinancialVolume não esteja disponível, substitua por: VolAtual := Volume }
   VolAtual := FinancialVolume;
 
-  { Média do volume financeiro dos últimos N períodos (linha de base) }
+  { Média do volume financeiro dos últimos N períodos — linha de base institucional }
   MediaVol := Average(FinancialVolume, PeriodoVolume);
+
+  { ADX — Índice Direcional Médio: mede a FORÇA da tendência (não a direção)
+    Valores baixos (< 25) indicam mercado lateral. Valores altos (> 30) indicam tendência.
+    Nota: use ADX(PeriodoADX) ou DMI(PeriodoADX) conforme sua versão do Profit Pro }
+  ValorADX := ADX(PeriodoADX);
+
+  { RSI — Índice de Força Relativa: mede velocidade e magnitude do movimento
+    Zonas extremas (< 30 ou > 70) indicam exaustão direcional.
+    Nota: use RSI(Close, PeriodoRSI) ou IFR(PeriodoRSI) conforme a versão }
+  ValorRSI := RSI(Close, PeriodoRSI);
 
 
   // ============================================================
   // SEÇÃO 4: AVALIAÇÃO DO HORÁRIO OPERACIONAL
   // ============================================================
 
-  { Horário do candle atual em formato HHMM (ex: 09h15m = 915) }
+  { Horário do candle atual em formato inteiro HHMM (ex: 09h25m = 925) }
   HoraAtual := Time;
 
   { Janela de entradas: apenas entre HoraInicio e HoraFim }
   JanelaAberta := (HoraAtual >= HoraInicio) and (HoraAtual < HoraFim);
 
-  { Zeragem: ativada a partir de HoraZerar, independente de sinal }
+  { Zeragem: ativada a partir de HoraZerar, com prioridade máxima }
   DeveZerar := (HoraAtual >= HoraZerar);
 
 
   // ============================================================
   // SEÇÃO 5: ZERAGEM COMPULSÓRIA — MÁXIMA PRIORIDADE
   //
-  // Avaliada ANTES de qualquer sinal para garantir que nenhuma
-  // posição sobreviva ao horário configurado. ClosePosition envia
-  // ordem a mercado e cancela todas as ordens pendentes (OCO).
+  // Avaliada ANTES de qualquer sinal. ClosePosition cancela todas
+  // as ordens pendentes (inclusive o par OCO ativo) e fecha a
+  // posição a mercado.
   // ============================================================
   if DeveZerar and HasPosition then
   begin
@@ -137,37 +206,111 @@ begin
   end
 
   // ============================================================
-  // SEÇÃO 6: LÓGICA DE SINAIS E EXECUÇÃO DE ORDENS
+  // SEÇÃO 6: AVALIAÇÃO DOS CRITÉRIOS ATÔMICOS
   //
-  // Pré-condições obrigatórias para qualquer nova entrada:
-  //   1. JanelaAberta = TRUE  → dentro do horário operacional
-  //   2. HasPosition  = FALSE → sem posição aberta no momento
-  //      (evita preço médio e reentradas no mesmo movimento)
+  // Cada critério é calculado separadamente e nomeado de forma
+  // descritiva. Isso facilita debug via log do Profit Pro e
+  // permite desativar filtros individualmente durante backtests.
   // ============================================================
   else if JanelaAberta and (not HasPosition) then
   begin
 
     // ----------------------------------------------------------
-    // DEFINIÇÃO DOS SINAIS DE MERCADO
-    //
-    // Exaustão por Volatilidade + Confirmação de Volume:
-    //
-    //   SINAL LONG  → preço perfura a banda inferior com volume
-    //                 acima de (MediaVol × FatorVolume).
-    //                 Leitura: vendedores capitulando + presença
-    //                 institucional = reversão de alta provável.
-    //
-    //   SINAL SHORT → preço perfura a banda superior com volume
-    //                 acima de (MediaVol × FatorVolume).
-    //                 Leitura: compradores esgotados + presença
-    //                 institucional = reversão de baixa provável.
+    // [v1] CRITÉRIOS ORIGINAIS — Base da Estratégia
     // ----------------------------------------------------------
 
-    { Sinal de Compra: fechamento abaixo da Banda Inferior com volume elevado }
-    SinalLong := (Close < BandaInf) and (VolAtual > (MediaVol * FatorVolume));
+    { Preço perfurou a banda inferior (condição primária de Long) }
+    Crit_BandaLong  := (Close < BandaInf);
 
-    { Sinal de Venda: fechamento acima da Banda Superior com volume elevado }
-    SinalShort := (Close > BandaSup) and (VolAtual > (MediaVol * FatorVolume));
+    { Preço perfurou a banda superior (condição primária de Short) }
+    Crit_BandaShort := (Close > BandaSup);
+
+    { Volume financeiro acima do limiar — confirma presença institucional }
+    Crit_Volume := (VolAtual > (MediaVol * FatorVolume));
+
+
+    // ----------------------------------------------------------
+    // [v2] FILTRO 1 — ADX: REGIME DE MERCADO
+    //
+    // Critério mais impactante para estratégias de reversão.
+    // ADX < LimiteADX significa que o mercado está oscilando
+    // sem direcionalidade forte, condição ideal para que o
+    // preço reverta à média após tocar a banda.
+    //
+    // ADX alto (> 30) indica tendência: nesse cenário o preço
+    // continua além da banda, gerando perdas sucessivas.
+    // ----------------------------------------------------------
+    Crit_ADX := (ValorADX < LimiteADX);
+
+
+    // ----------------------------------------------------------
+    // [v2] FILTRO 2 — RSI: CONFIRMAÇÃO DE EXAUSTÃO
+    //
+    // Exige que a velocidade do movimento (RSI) corrobore a
+    // leitura de exaustão já indicada pelo Bollinger.
+    // Sem esse filtro, o robô pode entrar quando o preço está
+    // na banda inferior mas RSI ainda está em 50 (neutro),
+    // indicando que o movimento tem energia para continuar.
+    // ----------------------------------------------------------
+    Crit_RSILong  := (ValorRSI < LimiteRSIBaixo); { Sobrevenda confirmada }
+    Crit_RSIShort := (ValorRSI > LimiteRSIAlto);  { Sobrecompra confirmada }
+
+
+    // ----------------------------------------------------------
+    // [v2] FILTRO 3 — REJEIÇÃO DE SOMBRA (PADRÃO MAIS FORTE)
+    //
+    // Exige que o candle de sinal demonstre rejeição explícita:
+    //
+    //   LONG: Low < BandaInf (sombra furou a banda)
+    //         E Close >= BandaInf (mas fechou de volta acima)
+    //   → Vendedores tentaram romper, compradores reagiram e
+    //     trouxeram o preço de volta ainda no mesmo candle.
+    //     Sinal muito mais forte que simples fechamento fora.
+    //
+    //   SHORT: High > BandaSup (sombra furou a banda)
+    //          E Close <= BandaSup (mas fechou de volta abaixo)
+    //   → Compradores tentaram romper, vendedores reagiram e
+    //     derrubaram o preço de volta ainda no mesmo candle.
+    //
+    // Este filtro elimina entradas em rompimentos genuínos onde
+    // o preço fecha longe da banda, mostrando força direcional.
+    // ----------------------------------------------------------
+    Crit_RejeicaoLong  := (Low < BandaInf) and (Close >= BandaInf);
+    Crit_RejeicaoShort := (High > BandaSup) and (Close <= BandaSup);
+
+
+    // ----------------------------------------------------------
+    // [v2] FILTRO DE LARGURA DE BANDA
+    //
+    // Banda estreita demais → mercado comprimido, explosão
+    // direcional iminente (pior momento para reversão).
+    // Banda larga demais  → tendência em curso camuflada
+    // de volatilidade, reversão com baixa probabilidade.
+    // ----------------------------------------------------------
+    Crit_LarguraBanda := (LarguraPct >= LarguraMinPct) and (LarguraPct <= LarguraMaxPct);
+
+
+    // ----------------------------------------------------------
+    // COMPOSIÇÃO DOS SINAIS FINAIS
+    //
+    // Todos os critérios devem ser TRUE simultaneamente.
+    // O conjunto de filtros atua como uma grade: cada camada
+    // independente filtra um tipo diferente de sinal ruim.
+    // ----------------------------------------------------------
+
+    { SINAL LONG: rejeição na banda inferior + volume + ADX lateral + RSI sobrevenda + banda viável }
+    SinalLong := Crit_RejeicaoLong
+             and Crit_Volume
+             and Crit_ADX
+             and Crit_RSILong
+             and Crit_LarguraBanda;
+
+    { SINAL SHORT: rejeição na banda superior + volume + ADX lateral + RSI sobrecompra + banda viável }
+    SinalShort := Crit_RejeicaoShort
+              and Crit_Volume
+              and Crit_ADX
+              and Crit_RSIShort
+              and Crit_LarguraBanda;
 
 
     // ----------------------------------------------------------
@@ -175,19 +318,16 @@ begin
     // ----------------------------------------------------------
     if SinalLong then
     begin
-      { Calcula os níveis de saída a partir do fechamento do candle de sinal }
+      { Usa o Close do candle de sinal como referência para os níveis de saída }
       PrecoAlvo := Close + AlvoPontos;  { Take profit acima da entrada }
       PrecoStop := Close - StopPontos;  { Stop loss abaixo da entrada  }
 
-      { Envia ordem de compra a mercado }
+      { Ordem de compra a mercado }
       BuyAtMarket;
 
-      { Par OCO de saída para posição comprada:
-          SellToLimit → venda limitada no alvo   (take profit)
-          SellToStop  → venda com stop no gatilho (stop loss)
-        A execução de uma cancela automaticamente a outra. }
-      SellToLimit(PrecoAlvo);
-      SellToStop(PrecoStop);
+      { Par OCO de saída: quando uma é executada, a outra é cancelada }
+      SellToLimit(PrecoAlvo);  { Saída no lucro — venda limitada no alvo }
+      SellToStop(PrecoStop);   { Saída no prejuízo — stop abaixo da entrada }
     end
 
     // ----------------------------------------------------------
@@ -195,19 +335,16 @@ begin
     // ----------------------------------------------------------
     else if SinalShort then
     begin
-      { Calcula os níveis de saída a partir do fechamento do candle de sinal }
+      { Usa o Close do candle de sinal como referência para os níveis de saída }
       PrecoAlvo := Close - AlvoPontos;  { Take profit abaixo da entrada }
       PrecoStop := Close + StopPontos;  { Stop loss acima da entrada    }
 
-      { Envia ordem de venda a descoberto a mercado }
+      { Ordem de venda a descoberto a mercado }
       SellShortAtMarket;
 
-      { Par OCO de saída para posição vendida:
-          BuyToLimit → compra limitada no alvo    (take profit)
-          BuyToStop  → compra com stop no gatilho (stop loss)
-        A execução de uma cancela automaticamente a outra. }
-      BuyToLimit(PrecoAlvo);
-      BuyToStop(PrecoStop);
+      { Par OCO de saída: quando uma é executada, a outra é cancelada }
+      BuyToLimit(PrecoAlvo);  { Saída no lucro — compra limitada no alvo }
+      BuyToStop(PrecoStop);   { Saída no prejuízo — stop acima da entrada }
     end;
 
   end; { fim do bloco JanelaAberta }
