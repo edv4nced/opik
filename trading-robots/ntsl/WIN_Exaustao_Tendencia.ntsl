@@ -118,8 +118,15 @@ input
   MultiplicadorAlvo : float   := 2.5; { Alvo  = ATR × multiplicador → R:R 1.67 }
 
   { --- NOVO v3: Controles de Disciplina Operacional --- }
-  MaxTradesDia : integer := 3;  { Máximo de entradas por sessão              }
-  BaresEspera  : integer := 3;  { Candles de pausa após encerrar posição     }
+  MaxTradesDia   : integer := 3;   { Máximo de entradas por sessão               }
+  BaresEspera    : integer := 3;   { Candles de pausa após encerrar posição      }
+
+  { --- Meta e Stop de Perda Diária --- }
+  { Quando LucroDiario >= MetaPontosDia  → para de abrir novas entradas no dia.
+    Quando LucroDiario <= -MaxPerdaDiaria → idem.
+    Ajuste esses valores de acordo com o capital e perfil de risco. }
+  MetaPontosDia  : integer := 300; { Meta de ganho diária em pontos do WIN       }
+  MaxPerdaDiaria : integer := 200; { Limite de perda diária em pontos do WIN     }
 end;
 
 
@@ -150,6 +157,12 @@ var
   ContadorTrades : integer; { Trades abertos na sessão corrente               }
   CoolDown       : integer; { Contador regressivo de espera pós-encerramento  }
   PosicaoAnt     : boolean; { HasPosition no bar anterior — detecta fechamento }
+
+  { Controle de P&L Diário }
+  LucroDiario       : float;   { Pontos acumulados no dia (positivo=gain, negativo=loss) }
+  ResultadoTrade    : float;   { Resultado do trade recém-encerrado (cálculo temporário) }
+  PrecoEntradaSalvo : float;   { Preço de entrada preservado para calcular o resultado   }
+  DirecaoLong       : boolean; { TRUE = posição comprada | FALSE = posição vendida       }
 
   { Níveis de Saída das Ordens }
   PrecoAlvo    : float;  { Take profit calculado via ATR × MultiplicadorAlvo }
@@ -241,6 +254,7 @@ begin
   if Date <> DataAnterior then
   begin
     ContadorTrades := 0;    { Reinicia contagem de trades para o novo pregão }
+    LucroDiario    := 0;    { Zera o acumulador de P&L ao início de cada dia }
     DataAnterior   := Date; { Atualiza referência de data                    }
   end;
 
@@ -260,8 +274,32 @@ begin
 
   if PosicaoAnt and (not HasPosition) then
   begin
-    { Posição foi encerrada neste bar — ativa cool-down }
-    CoolDown := BaresEspera;
+    { Posição foi encerrada neste bar — calcula resultado e acumula no P&L diário.
+      Lógica: verifica qual nível foi atingido no bar de saída (Low/High).
+        Long : Low <= PrecoStop → stop atingido (perda) | senão → alvo atingido (gain)
+        Short: High >= PrecoStop → stop atingido (perda) | senão → alvo atingido (gain)
+      Caso de zeragem compulsória: nenhum nível atingido → usa Close como aproximação. }
+    if DirecaoLong then
+    begin
+      if Low <= PrecoStop then
+        ResultadoTrade := PrecoStop - PrecoEntradaSalvo    { Stop: resultado negativo }
+      else if High >= PrecoAlvo then
+        ResultadoTrade := PrecoAlvo - PrecoEntradaSalvo    { Alvo: resultado positivo }
+      else
+        ResultadoTrade := Close - PrecoEntradaSalvo;       { Zeragem a mercado        }
+    end
+    else
+    begin
+      if High >= PrecoStop then
+        ResultadoTrade := PrecoEntradaSalvo - PrecoStop    { Stop: resultado negativo }
+      else if Low <= PrecoAlvo then
+        ResultadoTrade := PrecoEntradaSalvo - PrecoAlvo    { Alvo: resultado positivo }
+      else
+        ResultadoTrade := PrecoEntradaSalvo - Close;       { Zeragem a mercado        }
+    end;
+
+    LucroDiario := LucroDiario + ResultadoTrade; { Acumula no totalizador do dia }
+    CoolDown    := BaresEspera;                  { Ativa pausa pós-encerramento  }
   end;
 
   { Decrementa contador a cada bar (zera naturalmente ao atingir 0) }
@@ -345,10 +383,13 @@ begin
     Crit_MomLong  := (ValorRSI > ValorRSIAnt);
     Crit_MomShort := (ValorRSI < ValorRSIAnt);
 
-    { [DISCIPLINA] Critério combinado de limite diário
-        ContadorTrades é incrementado logo após a ordem ser enviada,
-        então a comparação com MaxTradesDia bloqueia entradas extras. }
-    Crit_Disciplina := (ContadorTrades < MaxTradesDia);
+    { [DISCIPLINA] Critério combinado de disciplina operacional:
+        - Abaixo do limite de trades por dia
+        - Lucro acumulado abaixo da meta (ainda não atingiu o objetivo)
+        - Perda acumulada abaixo do stop diário (não queimou o limite) }
+    Crit_Disciplina := (ContadorTrades < MaxTradesDia)
+                   and (LucroDiario < MetaPontosDia)
+                   and (LucroDiario > -MaxPerdaDiaria);
 
 
     // ----------------------------------------------------------
@@ -396,7 +437,10 @@ begin
       SellToLimit(PrecoAlvo);  { Take profit — venda limitada no alvo }
       SellToStop(PrecoStop);   { Stop loss  — venda stop abaixo da entrada }
 
-      { Contabiliza a entrada para o controle de limite diário }
+      { Salva dados da entrada para cálculo de P&L ao encerrar }
+      PrecoEntradaSalvo := Close;
+      DirecaoLong       := true;
+
       ContadorTrades := ContadorTrades + 1;
     end
 
@@ -412,6 +456,10 @@ begin
       SellShortAtMarket;      { Ordem de venda a descoberto a mercado }
       BuyToLimit(PrecoAlvo);  { Take profit — compra limitada no alvo }
       BuyToStop(PrecoStop);   { Stop loss  — compra stop acima da entrada }
+
+      { Salva dados da entrada para cálculo de P&L ao encerrar }
+      PrecoEntradaSalvo := Close;
+      DirecaoLong       := false;
 
       ContadorTrades := ContadorTrades + 1;
     end;
